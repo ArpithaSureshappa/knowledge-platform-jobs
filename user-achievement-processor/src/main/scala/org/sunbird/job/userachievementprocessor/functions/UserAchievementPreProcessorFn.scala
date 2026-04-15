@@ -852,13 +852,14 @@ class UserAchievementPreProcessorFn(config: UserBadgeAwardingConfig, httpUtil: H
 
       val currentTime = System.currentTimeMillis()
       var isEligible = false
+      var badgeEarningDateTime: Long = 0L
 
       if (!badgeEarningDateEnabled) {
         // If badgeEarningDateEnabled is false, user is eligible
         isEligible = true
         logger.info(s"badgeEarningDateEnabled=false for programId=$programId, user is eligible")
       } else {
-        val badgeEarningDateTime: Long = Option(badgeDetailsObj.get(config.badgeEarningDateTimeKey))
+        badgeEarningDateTime = Option(badgeDetailsObj.get(config.badgeEarningDateTimeKey))
           .map(value => parseBadgeEarningDateTime(value))
           .getOrElse(0L)
 
@@ -898,20 +899,38 @@ class UserAchievementPreProcessorFn(config: UserBadgeAwardingConfig, httpUtil: H
           return
         }
 
-        val batchEnrolmentQuery = QueryBuilder.select("courseid", "status").from(config.coursesdb, config.enrolmentTable)
+        val batchEnrolmentQuery = QueryBuilder.select("courseid", "status", "completedOn").from(config.coursesdb, config.enrolmentTable)
           .where(QueryBuilder.eq("userid", userId)).and(QueryBuilder.in("courseid", childNodes.asJava))
 
         logger.info(s"Fetching completion status for ${childNodes.size} courses in single query for userId=$userId")
         val enrolmentRows = cassandraUtil.find(batchEnrolmentQuery.toString)
 
         var completedCount = 0
+        var completedCountAfterBadgeEarningDate = 0
         if (enrolmentRows != null && !enrolmentRows.isEmpty) {
           import scala.collection.JavaConverters._
           enrolmentRows.asScala.foreach { row =>
             val courseId = row.getString(config.courseId)
             val status = row.getInt("status")
+            val completedOnStr = row.getString("completedOn")
+            val completedOn: Long = try {
+              if (completedOnStr != null && completedOnStr.nonEmpty) {
+                parseBadgeEarningDateTime(completedOnStr)
+              } else {
+                0L
+              }
+            } catch {
+              case ex: Exception =>
+                logger.error(s"Failed to parse completedOn: $completedOnStr for courseId=$courseId", ex)
+                0L
+            }
             if (status == 2) {
               completedCount += 1
+              if (badgeEarningDateTime > completedOn) {
+                completedCount += 1
+              } else {
+                completedCountAfterBadgeEarningDate += 1
+              }
               logger.debug(s"Course $courseId completed for userId=$userId")
             }
           }
@@ -923,7 +942,7 @@ class UserAchievementPreProcessorFn(config: UserBadgeAwardingConfig, httpUtil: H
         if (completedCount >= requiredCompletionCount) {
           awardProgramBadge(userId, programId, programBatchId, badgeId, criteria, badgeTemplate, badgeTitle, currentTime,programName, metrics)
         } else {
-          logger.info(s"User has not completed required courses for programId=$programId")
+          logger.info(s"User has completed $completedCount courses within configured date time for badge and completed $completedCountAfterBadgeEarningDate courses after configured date time for programId=$programId")
         }
       }
     } catch {
